@@ -1,0 +1,293 @@
+Bootstrap: docker
+From: ubuntu:24.04
+
+# SPOTTER-AI x CLIO demo, base image: everything that is not a SPOTTER-AI repository, the
+# model or CLIO, and so rarely changes.
+#   tools (uv, Node, pnpm), Python 3.14 for CLIO, Valkey + MongoDB, a vLLM environment with
+#   Flowcept's dependencies, and the scripts that start the demo.
+# model.def builds on it (the model), and demo.def on that (SPOTTER-AI repositories, CLIO).
+# See README.md.
+
+%setup
+    mkdir -p "$APPTAINER_ROOTFS/cache"    # optional package cache bound at build time
+
+%environment
+    export PATH=/opt/tools/bin:/opt/tools/node/bin:$PATH
+    export PYTHONDONTWRITEBYTECODE=1
+    export LC_ALL=C.UTF-8 LANG=C.UTF-8
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    # --- pins ---------------------------------------------------------------------------------
+    UV_VERSION=0.11.32; NODE_VERSION=22.22.0; PNPM_VERSION=9.15.9
+    CLIO_PYTHON=3.14            # CLIO's .python-version
+    VLLM_VERSION=0.33.0
+    FLOWCEPT_DEPS=1.0.3         # Flowcept release whose dependencies the SPOTTER-AI fork shares
+    VALKEY_URL=https://download.valkey.io/releases/valkey-8.1.3-jammy-x86_64.tar.gz
+    VALKEY_SHA=afbbf9e71f171472679280f9e06a8039cf3f1ac7ab6dff76ef3094852c7a342f
+    MONGO_URL=https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2404-8.0.14.tgz
+    MONGO_SHA=9e6a8332ef0eddb52f7869d4363212b3ca379955fd70d80840d1b7fa6f5cb54b
+
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates curl git xz-utils jq procps \
+        libcurl4t64 libssl3t64 build-essential
+    rm -rf /var/lib/apt/lists/*
+
+    mkdir -p /opt/tools/bin /opt/build /opt/clio-demo/bin
+    if [ -d /cache/uv ]; then CACHE=/cache; else CACHE=/opt/build; fi
+    export UV_CACHE_DIR=$CACHE/uv UV_LINK_MODE=copy UV_PYTHON_INSTALL_DIR=/opt/python
+    export UV_COMPILE_BYTECODE=1   # ship .pyc: a read-only image cannot cache them at run time
+    export PATH=/opt/tools/bin:/opt/tools/node/bin:$PATH
+    cd /opt/build
+
+    # --- uv, Node, pnpm (pinned, checksummed) ---------------------------------------------------
+    t=uv-x86_64-unknown-linux-gnu.tar.gz
+    curl -fsSLO https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$t
+    curl -fsSLO https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$t.sha256
+    sha256sum -c $t.sha256 && tar -xzf $t && cp uv-x86_64-unknown-linux-gnu/uv* /opt/tools/bin/
+    t=node-v$NODE_VERSION-linux-x64.tar.xz
+    curl -fsSLO https://nodejs.org/dist/v$NODE_VERSION/$t
+    curl -fsSL https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt | grep " $t\$" | sha256sum -c -
+    tar -xJf $t -C /opt/tools && ln -sfn /opt/tools/node-v$NODE_VERSION-linux-x64 /opt/tools/node
+    npm install -g --prefix /opt/tools/node pnpm@$PNPM_VERSION
+    uv python install $CLIO_PYTHON
+
+    # --- Valkey + MongoDB (Flowcept's queue and store) ------------------------------------------
+    curl -fsSL -o valkey.tgz $VALKEY_URL && echo "$VALKEY_SHA  valkey.tgz" | sha256sum -c -
+    mkdir -p valkey && tar -xzf valkey.tgz -C valkey --strip-components=1
+    cp valkey/bin/valkey-server /opt/tools/bin/
+    curl -fsSL -o mongo.tgz $MONGO_URL && echo "$MONGO_SHA  mongo.tgz" | sha256sum -c -
+    mkdir -p mongo && tar -xzf mongo.tgz -C mongo --strip-components=1
+    cp mongo/bin/mongod /opt/tools/bin/
+
+    # --- vLLM + Flowcept's dependencies (the attention connector and Flowcept fork: demo.def) ----
+    uv venv --python 3.12 /opt/vllm
+    VIRTUAL_ENV=/opt/vllm uv pip install "vllm==$VLLM_VERSION" \
+        "flowcept[extras,webservice]==$FLOWCEPT_DEPS" "huggingface_hub[cli]"
+
+    # --- the demo's start-up scripts ----------------------------------------------------------
+    cat > /opt/clio-demo/bin/vllm_attention_launcher.py <<'PYEOF'
+"""vLLM OpenAI server with the SPOTTER-AI attention connector (CLIO's native-cuda-attention recipe).
+
+Env: FLOWCEPT_SETTINGS_PATH, ATTN_WORKFLOW_ID, ATTN_OUT_DIR. Remaining argv goes to vLLM.
+"""
+import json
+import os
+import runpy
+import sys
+
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+import vllm_attn_connector  # noqa: E402
+
+if not vllm_attn_connector.install_probe():
+    raise RuntimeError("the attention probe could not be activated")
+from flowcept import Flowcept  # noqa: E402
+
+workflow = os.environ["ATTN_WORKFLOW_ID"]
+sys.argv = ["vllm"] + sys.argv[1:] + ["--kv-transfer-config", json.dumps({
+    "kv_connector": "AttnConnector",
+    "kv_connector_module_path": "vllm_attn_connector",
+    "kv_role": "kv_producer",
+    "kv_connector_extra_config": {"workflow_id": workflow, "out_dir": os.environ["ATTN_OUT_DIR"]},
+})]
+if __name__ == "__main__":
+    # The separate collector is the sole persistence owner.
+    with Flowcept("vllm", workflow_id=workflow, workflow_name="CLIO attention",
+                  start_persistence=False):
+        runpy.run_module("vllm.entrypoints.openai.api_server", run_name="__main__")
+PYEOF
+
+    cat > /opt/clio-demo/bin/flowcept_collector.py <<'PYEOF'
+"""Flowcept collector: DocumentInserter (MQ -> MongoDB) + Flowcept web API (CLIO's managed recipe).
+
+Env: FLOWCEPT_SETTINGS_PATH, FLOWCEPT_WEB_PORT, COLLECTOR_OWNER.
+"""
+import os
+
+import uvicorn
+from flowcept.flowceptor.consumers.document_inserter import DocumentInserter
+from flowcept.webservice.main import app
+
+owner = os.environ.get("COLLECTOR_OWNER", "clio-demo")
+collector = DocumentInserter(check_safe_stops=False, bundle_exec_id=owner)
+collector.start(threaded=True)
+try:
+    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("FLOWCEPT_WEB_PORT", "18008")),
+                log_level="warning")
+finally:
+    collector.stop(bundle_exec_id=owner)
+PYEOF
+
+    cat > /opt/clio-demo/bin/start-demo.sh <<'SHEOF'
+#!/bin/bash
+# Start the SPOTTER-AI x CLIO demo inside the container:
+#   Valkey -> MongoDB -> Flowcept collector -> vLLM (+ attention connector) -> CLIO
+# then register vLLM as CLIO's model server. Ctrl+C stops everything.
+#
+# Settings (environment, all optional):
+#   CLIO_DEMO_STATE      writable state dir (default ~/.clio-demo): databases, captures, logs, CLIO home
+#   CLIO_PORT            CLIO web UI + API (default 8100)
+#   VLLM_PORT (18000)  VALKEY_PORT (16379)  MONGO_PORT (37017)  FLOWCEPT_WEB_PORT (18008)
+#   VLLM_MAX_MODEL_LEN   context length (default 8192; lower it if vLLM runs out of GPU memory)
+#   VLLM_GPU_UTIL        fraction of GPU memory vLLM may use (default 0.85)
+#   VLLM_EXTRA_ARGS      extra vLLM flags
+#   CLIO_DEMO_KEEP=1     keep sessions, databases and captures from the previous run
+set -euo pipefail
+
+STATE="${CLIO_DEMO_STATE:-$HOME/.clio-demo}"
+CLIO_PORT="${CLIO_PORT:-8100}"
+VLLM_PORT="${VLLM_PORT:-18000}"
+VALKEY_PORT="${VALKEY_PORT:-16379}"
+MONGO_PORT="${MONGO_PORT:-37017}"
+FLOWCEPT_WEB_PORT="${FLOWCEPT_WEB_PORT:-18008}"
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
+VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.85}"
+MODEL_DIR=/opt/models/model
+MODEL_NAME="$(cat /opt/models/NAME 2>/dev/null || echo model)"
+TOOL_PARSER="$(cat /opt/models/TOOL_PARSER 2>/dev/null || echo hermes)"   # set by model.def
+WORKFLOW_ID="${ATTN_WORKFLOW_ID:-clio-demo-attention}"
+[ -x /opt/clio/clio-agent/.venv/bin/clio-agent ] || { echo "this is the base image; run demo.sif" >&2; exit 1; }
+
+if [ "${CLIO_DEMO_KEEP:-0}" != 1 ]; then
+  rm -rf "$STATE"/{logs,valkey,mongo,flowcept,captures,clio}   # clean start
+fi
+mkdir -p "$STATE"/{logs,valkey,mongo,flowcept,captures,clio,cache,demo}
+LOGS="$STATE/logs"
+cp -rn /opt/clio-demo/demo/. "$STATE/demo/" 2>/dev/null || true
+log() { echo "[clio-demo $(date +%H:%M:%S)] $*"; }
+
+port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+for p in "$CLIO_PORT" "$VLLM_PORT" "$VALKEY_PORT" "$MONGO_PORT" "$FLOWCEPT_WEB_PORT"; do
+  port_free "$p" || { echo "port $p is already in use on this machine; set the matching *_PORT variable" >&2; exit 1; }
+done
+
+PIDS=()
+cleanup() {
+  log "stopping"
+  for ((i=${#PIDS[@]}-1; i>=0; i--)); do kill "${PIDS[i]}" 2>/dev/null || true; done
+  for _ in $(seq 15); do   # vLLM can ignore SIGTERM while its engine starts: force after 15 s
+    alive=""; for pid in "${PIDS[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [ -z "$alive" ] && break; sleep 1
+  done
+  for pid in "${PIDS[@]}"; do pkill -9 -P "$pid" 2>/dev/null; kill -9 "$pid" 2>/dev/null; done
+  wait 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+wait_for() {  # wait_for NAME TIMEOUT_S CMD...
+  local name="$1" timeout="$2"; shift 2
+  local t=0
+  until "$@" >/dev/null 2>&1; do
+    sleep 2; t=$((t + 2))
+    for pid in "${PIDS[@]}"; do kill -0 "$pid" 2>/dev/null || { echo "$name: a service exited; see $LOGS" >&2; exit 1; }; done
+    [ "$t" -lt "$timeout" ] || { echo "$name not ready after ${timeout}s; see $LOGS" >&2; exit 1; }
+  done
+  log "$name ready"
+}
+
+export HF_HOME="$STATE/cache/hf" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export XDG_CACHE_HOME="$STATE/cache/xdg" VLLM_CACHE_ROOT="$STATE/cache/vllm"
+export TRITON_CACHE_DIR="$STATE/cache/triton" TORCHINDUCTOR_CACHE_DIR="$STATE/cache/inductor"
+export TMPDIR="$STATE/cache/tmp"; mkdir -p "$TMPDIR"
+export VLLM_USE_FLASHINFER_SAMPLER=0   # its JIT needs nvcc, which the image does not have
+
+valkey-server --bind 127.0.0.1 --port "$VALKEY_PORT" --dir "$STATE/valkey" --appendonly yes \
+  --protected-mode yes > "$LOGS/valkey.log" 2>&1 &
+PIDS+=($!)
+wait_for Valkey 30 bash -c "exec 3<>/dev/tcp/127.0.0.1/$VALKEY_PORT"
+
+mongod --bind_ip 127.0.0.1 --port "$MONGO_PORT" --dbpath "$STATE/mongo" \
+  --wiredTigerCacheSizeGB 0.25 > "$LOGS/mongod.log" 2>&1 &
+PIDS+=($!)
+wait_for MongoDB 60 bash -c "exec 3<>/dev/tcp/127.0.0.1/$MONGO_PORT"
+
+SETTINGS="$STATE/flowcept/settings.yaml"
+cat > "$SETTINGS" <<EOF
+{"project": {"db_flush_mode": "online"},
+ "log": {"log_path": "$LOGS/flowcept.log", "log_file_level": "error", "log_stream_level": "disable"},
+ "mq": {"enabled": true, "type": "redis", "uri": "redis://127.0.0.1:$VALKEY_PORT", "channel": "clio-demo",
+        "buffer_size": 1, "insertion_buffer_time_secs": 0.5},
+ "kv_db": {"enabled": true, "uri": "redis://127.0.0.1:$VALKEY_PORT"},
+ "databases": {"mongodb": {"enabled": true, "uri": "mongodb://127.0.0.1:$MONGO_PORT", "db": "clio"},
+               "lmdb": {"enabled": false}},
+ "db_buffer": {"buffer_size": 1, "insertion_buffer_time_secs": 0.5},
+ "agent": {"enabled": false, "chat_enabled": false, "start_persistence": false},
+ "web_server": {"dashboards_dir": "$STATE/flowcept/dashboards"}}
+EOF
+export FLOWCEPT_SETTINGS_PATH="$SETTINGS"
+FLOWCEPT_WEB_PORT="$FLOWCEPT_WEB_PORT" /opt/vllm/bin/python /opt/clio-demo/bin/flowcept_collector.py \
+  > "$LOGS/flowcept-collector.log" 2>&1 &
+PIDS+=($!)
+wait_for "Flowcept collector" 120 bash -c "exec 3<>/dev/tcp/127.0.0.1/$FLOWCEPT_WEB_PORT"
+
+# Greedy decoding: CLIO sends no temperature, and sampling at a model's default temperature
+# varies answers and can emit token splits that the canonical tokenizer cannot line up with
+# the capture. The tool-call parser comes with the model (model.def); no reasoning parser.
+log "starting vLLM (loading the model and sizing GPU memory: about a minute)"
+# shellcheck disable=SC2086
+ATTN_WORKFLOW_ID="$WORKFLOW_ID" ATTN_OUT_DIR="$STATE/captures" \
+  /opt/vllm/bin/python /opt/clio-demo/bin/vllm_attention_launcher.py \
+  --model "$MODEL_DIR" --served-model-name "$MODEL_NAME" --host 127.0.0.1 --port "$VLLM_PORT" \
+  --max-model-len "$VLLM_MAX_MODEL_LEN" --gpu-memory-utilization "$VLLM_GPU_UTIL" \
+  --max-num-seqs 1 --enforce-eager \
+  --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" \
+  --override-generation-config '{"temperature": 0}' \
+  ${VLLM_EXTRA_ARGS:-} > "$LOGS/vllm.log" 2>&1 &
+PIDS+=($!)
+wait_for vLLM 900 curl -sf "http://127.0.0.1:$VLLM_PORT/health"
+
+export CLIO_AGENT_HOME="$STATE/clio" CLIO_RUNTIME_STATE_DIR="$STATE/clio/runtime"
+export CLIO_WEB_DIR=/opt/clio/web CLIO_SEARCH_AUTO_INSTALL=0
+export CLIO_PROVENANCE_PROVIDERS=jsonl,flowcept CLIO_FLOWCEPT_PERSISTENCE_OWNER=collector
+export CLIO_PROVENANCE_ATTENTION=true
+export CLIO_PROVENANCE_ATTENTION_FILES_DIR="$STATE/captures"
+export CLIO_PROVENANCE_ATTENTION_TOKENIZER="$MODEL_DIR"
+/opt/clio/clio-agent/.venv/bin/clio-agent serve --host 127.0.0.1 --port "$CLIO_PORT" \
+  > "$LOGS/clio.log" 2>&1 &
+PIDS+=($!)
+wait_for CLIO 600 curl -sf "http://127.0.0.1:$CLIO_PORT/v1/health"
+
+# Register vLLM as CLIO's model server; CLIO answers 503 until its runtime has booted.
+ADDR="http://127.0.0.1:$VLLM_PORT/v1"
+API="http://127.0.0.1:$CLIO_PORT/v1/providers/servers"
+registered=""
+for _ in $(seq 1 100); do
+  if listing=$(curl -sf "$API"); then
+    if echo "$listing" | jq -e --arg a "$ADDR" '.servers[]? | select((.address|rtrimstr("/")) == $a)' >/dev/null; then
+      registered=yes; break
+    fi
+    if curl -sf -X POST -H 'content-type: application/json' "$API" \
+         -d "{\"address\":\"$ADDR\",\"preset_id\":\"vllm\"}" > "$LOGS/clio-model-server.json"; then
+      registered=yes; break
+    fi
+  fi
+  sleep 3
+done
+[ -n "$registered" ] || { echo "could not register vLLM with CLIO; see $LOGS/clio.log" >&2; exit 1; }
+log "vLLM registered with CLIO as a model server ($MODEL_NAME)"
+
+cat <<EOF
+
+  CLIO is ready:  http://127.0.0.1:$CLIO_PORT
+  Demo prompts:   $STATE/demo   (one .txt per round; paste them in order)
+  Logs:           $LOGS
+  Press Ctrl+C here to stop everything.
+
+EOF
+wait -n "${PIDS[@]}"
+echo "a service exited; see $LOGS" >&2
+SHEOF
+    chmod +x /opt/clio-demo/bin/start-demo.sh
+
+    printf 'uv %s, node %s, pnpm %s, python %s (CLIO), vllm %s, flowcept deps %s\n' \
+        $UV_VERSION $NODE_VERSION $PNPM_VERSION $CLIO_PYTHON $VLLM_VERSION $FLOWCEPT_DEPS > /opt/clio-demo/VERSIONS.base
+    rm -rf /opt/build
+    chmod -R a+rX /opt
+
+%runscript
+    exec /opt/clio-demo/bin/start-demo.sh "$@"
+
+%help
+    Base image of the SPOTTER-AI x CLIO demo (tools, databases, vLLM). Not runnable alone:
+    build model.sif and then demo.sif on top of it (see README.md).

@@ -1,0 +1,36 @@
+ROUND 2 - TASK (transition_sensitivity)
+Starting from the cadmium dose you identified in round 1, which accession
+loses the most Fv/Fm_Lss when the dose is raised to the next level of the
+design series?
+
+RULES
+1. The store also holds a pilot dose that is not a level of the
+   design series. The next level is the next one in the design
+   table, which need not be the next column.
+2. Compare each accession against itself across the two doses.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table="fc1_values", select=["genotype", "mean_value"], where="trait='Fv/Fm_Lss'", group_by=["genotype", "treatment"])
+    mean Fv/Fm_Lss by accession, one column per treatment in the store.
+    genotype  t25    t100   t175   t250
+    --------  -----  -----  -----  -----
+    NIL 369   0.529  0.492  0.458  0.428
+    99        0.546  0.508  0.357  0.350
+    81        0.534  0.501  0.473  0.463
+    Ecm14     0.549  0.507  0.458  0.251
+
+>>> design_lookup(aspect="dose_series")
+    the design levels, in order. Doses absent here are pilot cells.
+    level  treatment
+    -----  ---------
+    1      0
+    2      25
+    3      50
+    4      100
+    5      250
+    6      500
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <accession label exactly as it appears in the table>

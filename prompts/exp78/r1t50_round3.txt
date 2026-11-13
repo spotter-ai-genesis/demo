@@ -1,0 +1,33 @@
+ROUND 3 - TASK (cross_modality_peak)
+For the accession identified in round 2: at which dose does its leaf area
+(area_mm2) peak, and does that dose agree with where Fv/Fm_Lss peaked
+in round 1?
+
+RULES
+1. A cell flagged empty_mask carries no usable area and cannot be
+   the peak. low_mask_coverage is on nearly every row and is not a
+   reason to discard.
+2. The verdict is AGREES when the area peak falls on the dose from
+   round 1, and DISAGREES otherwise. Report both parts.
+
+TOOL OUTPUTS
+
+>>> db_lookup(table="features", select=["modality", "genotype", "mean_area_mm2"], where="trait='area_mm2'", group_by=["modality", "genotype", "treatment"])
+    mean area_mm2 by modality and accession, one column per treatment.
+    modality  genotype  t25    t100   t250   t500
+    --------  --------  -----  -----  -----  -----
+    rgb2      Ecm14     23.52  19.02  10.26  8.17
+    rgb2      ISU 61    20.61  12.06  9.28   6.54
+    rgb2      81        12.36  13.11  14.75  23.99
+    rgb2      NIL 369   10.68  13.05  22.34  13.35
+
+>>> qc_lookup(table="rgb2_features", select=["genotype", "treatment", "flag"], where="flag='empty_mask'")
+    cells voided by empty_mask.
+    genotype  treatment  flag
+    --------  ---------  ----------
+    Ecm14     25         empty_mask
+    ISU 61    250        empty_mask
+
+OUTPUT FORMAT
+Reply with exactly one line and nothing else:
+ANSWER: <dose in mg kg-1, digits only>; <AGREES or DISAGREES>

@@ -1,0 +1,34 @@
+Bootstrap: localimage
+From: base.sif
+
+# SPOTTER-AI x CLIO demo, model image: base.sif plus the model the demo serves, baked in so
+# the demo runs offline. Rebuild when the model changes; demo.def builds on it. See README.md.
+
+%setup
+    mkdir -p "$APPTAINER_ROOTFS/model-cache"   # optional: a local snapshot bound at build time
+
+%post
+    set -eux
+    # --- pins ---------------------------------------------------------------------------------
+    # Qwen3-4B-Instruct-2507, AWQ 4-bit (the model the demo chain was selected with)
+    MODEL_REPO=cyankiwi/Qwen3-4B-Instruct-2507-AWQ-4bit
+    MODEL_REV=b37d1ccb77e27a70fe4222d995fda27940eead5a
+    MODEL_NAME=Qwen3-4B-Instruct-2507-AWQ    # the name vLLM serves it under
+    TOOL_PARSER=hermes                       # vLLM's tool-call parser for this model family
+
+    # A host snapshot of exactly this revision may be bound at /model-cache (see README.md).
+    mkdir -p /opt/models/model
+    if [ -f /model-cache/config.json ]; then
+        cp -rL /model-cache/. /opt/models/model/
+    else
+        /opt/vllm/bin/hf download $MODEL_REPO --revision $MODEL_REV --local-dir /opt/models/model
+    fi
+    rm -rf /opt/models/model/.cache
+    echo "$MODEL_NAME" > /opt/models/NAME
+    echo "$TOOL_PARSER" > /opt/models/TOOL_PARSER
+    printf 'model %s@%s (served as %s)\n' $MODEL_REPO $MODEL_REV $MODEL_NAME > /opt/clio-demo/VERSIONS.model
+    chmod -R a+rX /opt/models
+
+%help
+    Model image of the SPOTTER-AI x CLIO demo (base.sif + the model). Not runnable alone:
+    build demo.sif on top of it (see README.md).

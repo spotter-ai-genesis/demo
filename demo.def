@@ -1,0 +1,75 @@
+Bootstrap: localimage
+From: model.sif
+
+# SPOTTER-AI x CLIO demo: the image that runs. On top of model.sif (base + model) it adds
+# what changes with the work: the SPOTTER-AI repositories (vLLM attention connector, Flowcept
+# fork) and CLIO (agent with the barebone agent, web UI with the green/red heat ramps).
+# Rebuild it whenever a pin below changes. See README.md.
+
+%setup
+    mkdir -p "$APPTAINER_ROOTFS/cache"   # optional package cache bound at build time
+
+%files
+    prompts /opt/clio-demo/demo
+
+%post
+    set -eux
+    # --- pins ---------------------------------------------------------------------------------
+    CONNECTOR_REV=e857fd0074f2c139a791f25286b8a9e44631d0d9   # spotter-ai-genesis/vllm-attn-connector
+    FLOWCEPT_REV=e638b4e2072290a2921965a03a150db124e11c2e    # spotter-ai-genesis/flowcept
+    # CLIO: the PR branches (bare agents + barebone + heat ramps), on iowarp develop
+    CLIO_REPO=https://github.com/bnicolae/clio-agent.git;              CLIO_REV=22ae981e9f9742f861900fcb26012621c7be04ad
+    MARKET_REPO=https://github.com/bnicolae/clio-agent-marketplace.git; MARKET_REV=eaaf620a1b4fde1ae55b1c5db7573743524064e9
+    UI_REPO=https://github.com/bnicolae/gact-tui.git;                  UI_REV=075c0581f1f9ef15d6206b0339e7c105889a546f
+
+    mkdir -p /opt/build
+    if [ -d /cache/uv ]; then CACHE=/cache; else CACHE=/opt/build; fi
+    export UV_CACHE_DIR=$CACHE/uv UV_LINK_MODE=copy UV_PYTHON_INSTALL_DIR=/opt/python
+    export UV_COMPILE_BYTECODE=1
+    export npm_config_cache=$CACHE/npm npm_config_store_dir=$CACHE/pnpm-store
+    export PATH=/opt/tools/bin:/opt/tools/node/bin:$PATH
+    cd /opt/build
+
+    # --- SPOTTER-AI: attention connector + Flowcept fork, into base's vLLM environment --------
+    git clone --quiet https://github.com/spotter-ai-genesis/vllm-attn-connector.git connector
+    git -C connector checkout --quiet $CONNECTOR_REV
+    # setuptools rejects the License classifier next to the SPDX expression
+    sed -i '/^classifiers = \["License :: OSI Approved :: MIT License"\]$/d' connector/pyproject.toml
+    uv build --wheel --out-dir wheels connector
+    VIRTUAL_ENV=/opt/vllm uv pip install wheels/vllm_attn_connector-*.whl \
+        "flowcept[extras,webservice] @ git+https://github.com/spotter-ai-genesis/flowcept.git@$FLOWCEPT_REV"
+
+    # --- CLIO: agent (uv env) + web UI, from the pinned commits --------------------------------
+    git clone --quiet $CLIO_REPO /opt/clio/clio-agent
+    cd /opt/clio/clio-agent && git checkout --quiet $CLIO_REV
+    git submodule update --init --quiet
+    git -C external/clio-agent-marketplace fetch --quiet $MARKET_REPO $MARKET_REV
+    git -C external/clio-agent-marketplace checkout --quiet $MARKET_REV
+    git -C external/gact-tui fetch --quiet $UI_REPO $UI_REV
+    git -C external/gact-tui checkout --quiet $UI_REV
+    uv sync --frozen --extra flowcept
+    cd external/gact-tui
+    printf '{"profile":"clio","brandingRoot":"/opt/clio/clio-agent/branding"}\n' > brand.config.local.json
+    pnpm install --frozen-lockfile && pnpm build
+    cp -a web/dist /opt/clio/web
+    rm -rf node_modules */node_modules   # build-only: the UI ships as static files
+    /opt/clio/clio-agent/.venv/bin/python -m compileall -q -j 0 /opt/clio/clio-agent/src \
+        /opt/clio/clio-agent/external/clio-agent-marketplace || true
+
+    # --- pins on record ---------------------------------------------------------------------------
+    { cat /opt/clio-demo/VERSIONS.base /opt/clio-demo/VERSIONS.model
+      printf 'vllm-attn-connector %s\nflowcept %s\n' $CONNECTOR_REV $FLOWCEPT_REV
+      printf 'clio-agent %s\nclio-agent-marketplace %s\ngact-tui %s\n' $CLIO_REV $MARKET_REV $UI_REV
+    } > /opt/clio-demo/VERSIONS
+    rm -rf /opt/build
+    chmod -R a+rX /opt
+
+%runscript
+    exec /opt/clio-demo/bin/start-demo.sh "$@"
+
+%help
+    SPOTTER-AI x CLIO live attention demo. Run with:
+        apptainer run --nv --cleanenv demo.sif
+    then open http://127.0.0.1:8100 and choose the Barebone agent. State goes to
+    $CLIO_DEMO_STATE (default ~/.clio-demo); demo prompts are copied there.
+    Versions: /opt/clio-demo/VERSIONS
